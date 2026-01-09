@@ -1,11 +1,15 @@
 import html
 import uuid
 from math import ceil
+import sqlite3
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 
 from config import BOT_TOKEN
 
@@ -14,15 +18,26 @@ from database import (
     list_entries, list_by_letter, find_entries,
     count_all, count_by_letter, count_find,
     delete_by_en, delete_by_id,
-    get_random_entry, get_entry_by_id
+    get_random_entry, get_entry_by_id,
+    # NEW:
+    update_entry, search_entries_both
 )
+
 from parser import parse_entry
 
-PAGE_SIZE = 15  # можно поменять
+PAGE_SIZE = 15
 
-# Хранилище поисковых запросов для пагинации /find
 # {user_id: {token: query}}
 FIND_CACHE: dict[int, dict[str, str]] = {}
+
+
+# -------------------- FSM --------------------
+
+class UiState(StatesGroup):
+    waiting_find = State()
+    waiting_delete = State()
+    waiting_edit_query = State()
+    waiting_edit_value = State()
 
 
 # -------------------- formatting --------------------
@@ -42,7 +57,6 @@ def format_item(row, reveal_ru: bool = True) -> str:
     if example:
         parts.append(f"  <i>{esc(example)}</i>")
     if tags:
-        # можно сделать '#tag', но пусть будет code
         parts.append(f"  <code>{esc(tags)}</code>")
     return "\n".join(parts)
 
@@ -63,24 +77,45 @@ def pages(total: int) -> int:
 
 # -------------------- keyboards --------------------
 
+def kb_menu() -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.button(text="📚 Список слов", callback_data="MENU|LIST")
+    b.button(text="🔤 По буквам (A–Z)", callback_data="MENU|LETTERS")
+    b.row()
+    b.button(text="🔎 Найти слово", callback_data="MENU|FIND")
+    b.button(text="✏️ Редактировать", callback_data="MENU|EDIT")
+    b.row()
+    b.button(text="🗑 Удалить слово", callback_data="MENU|DELETE")
+    b.button(text="🧠 Квиз", callback_data="MENU|QUIZ")
+    return b
+
+
+def kb_menu_row() -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.button(text="🏠 Меню", callback_data="MENU|HOME")
+    return b
+
+
+def kb_cancel() -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="CANCEL")
+    b.button(text="🏠 Меню", callback_data="MENU|HOME")
+    return b
+
+
 def kb_letters() -> InlineKeyboardBuilder:
     b = InlineKeyboardBuilder()
     letters = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
     for i, L in enumerate(letters, start=1):
-        b.button(text=L, callback_data=f"LET|{L}|0")  # page 0
+        b.button(text=L, callback_data=f"LET|{L}|0")
         if i % 6 == 0:
             b.row()
+    b.row()
+    b.attach(kb_menu_row())
     return b
 
 
 def kb_pager(mode: str, page: int, total_pages: int, extra: str = "") -> InlineKeyboardBuilder:
-    """
-    mode:
-      ALL -> "ALL|page"
-      LET -> "LET|A|page"
-      FIND -> "FIND|token|page"
-    extra is already included in callback_data by caller, here we just build arrows.
-    """
     b = InlineKeyboardBuilder()
 
     left_page = max(0, page - 1)
@@ -99,25 +134,23 @@ def kb_pager(mode: str, page: int, total_pages: int, extra: str = "") -> InlineK
         b.button(text=" ", callback_data="NOP")
 
     b.row()
+    b.attach(kb_menu_row())
     return b
 
 
 def kb_all(page: int, total_pages: int) -> InlineKeyboardBuilder:
     b = kb_pager("ALL", page, total_pages)
-    # добавим A–Z ниже
     b.attach(kb_letters())
     return b
 
 
 def kb_letter(letter: str, page: int, total_pages: int) -> InlineKeyboardBuilder:
-    # extra: "A|"
     b = kb_pager("LET", page, total_pages, extra=f"{letter}|")
     b.attach(kb_letters())
     return b
 
 
 def kb_find(token: str, page: int, total_pages: int) -> InlineKeyboardBuilder:
-    # extra: "token|"
     b = kb_pager("FIND", page, total_pages, extra=f"{token}|")
     return b
 
@@ -129,6 +162,34 @@ def kb_quiz(entry_id: int, revealed: bool) -> InlineKeyboardBuilder:
         b.row()
     b.button(text="Следующее ➡️", callback_data="QUIZ|NEXT|0")
     b.button(text="Удалить 🗑️", callback_data=f"QUIZ|DEL|{entry_id}")
+    b.row()
+    b.attach(kb_menu_row())
+    return b
+
+
+def kb_edit_pick(rows) -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    for (entry_id, en, ru, example, tags) in rows:
+        label = f"{en} — {ru}"
+        if len(label) > 45:
+            label = label[:42] + "..."
+        b.button(text=label, callback_data=f"EDIT|PICK|{entry_id}")
+        b.row()
+    b.row()
+    b.attach(kb_menu_row())
+    return b
+
+
+def kb_edit_fields(entry_id: int) -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.button(text="EN (английское)", callback_data=f"EDIT|FIELD|en|{entry_id}")
+    b.button(text="RU (перевод)", callback_data=f"EDIT|FIELD|ru|{entry_id}")
+    b.row()
+    b.button(text="Example (пример)", callback_data=f"EDIT|FIELD|example|{entry_id}")
+    b.button(text="Tags (теги)", callback_data=f"EDIT|FIELD|tags|{entry_id}")
+    b.row()
+    b.button(text="❌ Отмена", callback_data="CANCEL")
+    b.button(text="🏠 Меню", callback_data="MENU|HOME")
     return b
 
 
@@ -152,15 +213,6 @@ async def edit_all(call: CallbackQuery, page: int):
     text = format_list(rows, title=f"Словарь (всего: {total})")
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb_all(page, tp).as_markup())
     await call.answer()
-
-
-async def send_letter(message: Message, letter: str, page: int = 0):
-    total = count_by_letter(message.from_user.id, letter)
-    tp = pages(total)
-    page = min(max(page, 0), tp - 1)
-    rows = list_by_letter(message.from_user.id, letter, limit=PAGE_SIZE, offset=page * PAGE_SIZE)
-    text = format_list(rows, title=f"Буква {letter} (всего: {total})")
-    await message.answer(text, parse_mode="HTML", reply_markup=kb_letter(letter, page, tp).as_markup())
 
 
 async def edit_letter(call: CallbackQuery, letter: str, page: int):
@@ -192,7 +244,7 @@ async def edit_find(call: CallbackQuery, token: str, page: int):
     uid = call.from_user.id
     q = FIND_CACHE.get(uid, {}).get(token)
     if not q:
-        await call.answer("Поиск устарел. Повтори /find …", show_alert=True)
+        await call.answer("Поиск устарел. Нажми «Найти слово» ещё раз.", show_alert=True)
         return
 
     total = count_find(uid, q)
@@ -205,122 +257,200 @@ async def edit_find(call: CallbackQuery, token: str, page: int):
     await call.answer()
 
 
-# -------------------- commands --------------------
+# -------------------- menu actions --------------------
 
-async def cmd_start(message: Message):
-    await message.answer(
-        "Привет! Я твой личный словарь.\n\n"
-        "Добавляй так:\n"
-        "<b>word — перевод | ex: пример | tag: тег</b>\n\n"
-        "Команды:\n"
-        "/list — список + кнопки A–Z\n"
-        "/letter A — слова на букву\n"
-        "/find apple — поиск\n"
-        "/delete apple — удалить\n"
-        "/quiz — режим повторения\n",
-        parse_mode="HTML"
-    )
+async def show_menu(message: Message, state: FSMContext | None = None):
+    if state:
+        await state.clear()
+    await message.answer("Выбери действие:", reply_markup=kb_menu().as_markup())
 
 
-async def cmd_list(message: Message):
-    await send_all(message, page=0)
+async def cb_menu(call: CallbackQuery, state: FSMContext):
+    _, action = call.data.split("|", 1)
 
+    # сбрасываем ожидания ввода
+    await state.clear()
 
-async def cmd_letter(message: Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Напиши так: /letter A", parse_mode="HTML")
+    if action == "HOME":
+        await call.message.answer("Выбери действие:", reply_markup=kb_menu().as_markup())
+        await call.answer()
         return
-    letter = parts[1].strip()[:1].upper()
-    if not ("A" <= letter <= "Z"):
-        await message.answer("Нужна латинская буква A–Z.", parse_mode="HTML")
+
+    if action == "LIST":
+        await call.answer()
+        await send_all(call.message, page=0)
         return
-    await send_letter(message, letter, page=0)
 
-
-async def cmd_find(message: Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Напиши так: /find apple", parse_mode="HTML")
+    if action == "LETTERS":
+        await call.answer()
+        await call.message.answer("Выбери букву:", reply_markup=kb_letters().as_markup())
         return
-    q = parts[1].strip()
-    await send_find(message, q, page=0)
 
-
-async def cmd_delete(message: Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Напиши так: /delete apple", parse_mode="HTML")
-        return
-    en = parts[1].strip()
-    n = delete_by_en(message.from_user.id, en)
-    if n:
-        await message.answer(f"Удалено ✅: <b>{esc(en)}</b>", parse_mode="HTML")
-    else:
-        await message.answer(f"Не найдено слово: <b>{esc(en)}</b>", parse_mode="HTML")
-
-
-async def cmd_quiz(message: Message):
-    row = get_random_entry(message.from_user.id)
-    if not row:
-        await message.answer("Словарь пуст — сначала добавь пару слов", parse_mode="HTML")
-        return
-    text = "Карточка:\n\n" + format_item(row, reveal_ru=False)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb_quiz(row[0], revealed=False).as_markup())
-
-
-# -------------------- adding by plain text --------------------
-
-async def on_text(message: Message):
-    parsed = parse_entry(message.text)
-    if not parsed:
-        await message.answer(
-            "Не понял формат\n"
-            "Попробуй так:\n<b>word — перевод | ex: пример | tag: тег</b>",
-            parse_mode="HTML"
+    if action == "FIND":
+        await call.answer()
+        await state.set_state(UiState.waiting_find)
+        await call.message.answer(
+            "Введите слово <b>на русском или английском</b>, а я найду его в словаре:",
+            parse_mode="HTML",
+            reply_markup=kb_cancel().as_markup()
         )
         return
 
-    upsert_entry(
-        user_id=message.from_user.id,
-        en=parsed["en"],
-        ru=parsed["ru"],
-        example=parsed["example"],
-        tags=parsed["tags"]
+    if action == "DELETE":
+        await call.answer()
+        await state.set_state(UiState.waiting_delete)
+        await call.message.answer(
+            "Введите <b>английское слово/фразу</b>, которую нужно удалить (точно как в словаре):",
+            parse_mode="HTML",
+            reply_markup=kb_cancel().as_markup()
+        )
+        return
+
+    if action == "EDIT":
+        await call.answer()
+        await state.set_state(UiState.waiting_edit_query)
+        await call.message.answer(
+            "Введите слово <b>на русском или английском</b>, которое хотите отредактировать:",
+            parse_mode="HTML",
+            reply_markup=kb_cancel().as_markup()
+        )
+        return
+
+    if action == "QUIZ":
+        await call.answer()
+        row = get_random_entry(call.from_user.id)
+        if not row:
+            await call.message.answer("Словарь пуст — сначала добавь пару слов.", parse_mode="HTML")
+            return
+        text = "Карточка:\n\n" + format_item(row, reveal_ru=False)
+        await call.message.answer(text, parse_mode="HTML", reply_markup=kb_quiz(row[0], revealed=False).as_markup())
+        return
+
+    await call.answer()
+
+
+async def cb_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer("Отменено")
+    await call.message.answer("Ок, отмена. Выбери действие:", reply_markup=kb_menu().as_markup())
+
+
+# -------------------- state text handlers --------------------
+
+async def on_find_query(message: Message, state: FSMContext):
+    q = (message.text or "").strip()
+    await state.clear()
+    if not q:
+        await message.answer("Пустой запрос. Попробуй ещё раз.", reply_markup=kb_menu().as_markup())
+        return
+    await send_find(message, q, page=0)
+
+
+async def on_delete_query(message: Message, state: FSMContext):
+    en = (message.text or "").strip()
+    await state.clear()
+    if not en:
+        await message.answer("Пустой ввод. Попробуй ещё раз.", reply_markup=kb_menu().as_markup())
+        return
+
+    n = delete_by_en(message.from_user.id, en)
+    if n:
+        await message.answer(f"Удалено ✅: <b>{esc(en)}</b>", parse_mode="HTML", reply_markup=kb_menu().as_markup())
+    else:
+        await message.answer(f"Не найдено: <b>{esc(en)}</b>", parse_mode="HTML", reply_markup=kb_menu().as_markup())
+
+
+async def on_edit_query(message: Message, state: FSMContext):
+    q = (message.text or "").strip()
+    await state.clear()
+
+    if not q:
+        await message.answer("Пустой запрос. Попробуй ещё раз.", reply_markup=kb_menu().as_markup())
+        return
+
+    rows = search_entries_both(message.from_user.id, q, limit=10)
+    if not rows:
+        await message.answer("Ничего не нашла. Попробуй другое слово.", reply_markup=kb_menu().as_markup())
+        return
+
+    await message.answer("Выбери запись для редактирования:", reply_markup=kb_edit_pick(rows).as_markup())
+
+
+async def on_edit_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    entry_id = data.get("edit_entry_id")
+    field = data.get("edit_field")
+
+    value = (message.text or "").strip()
+    await state.clear()
+
+    if not entry_id or not field:
+        await message.answer("Не смогла понять, что редактируем. Открой меню и попробуй снова.", reply_markup=kb_menu().as_markup())
+        return
+
+    if value == "-":
+        value = ""
+
+    kwargs = {}
+    if field in ("en", "ru", "example", "tags"):
+        kwargs[field] = value
+    else:
+        await message.answer("Неизвестное поле.", reply_markup=kb_menu().as_markup())
+        return
+
+    try:
+        n = update_entry(message.from_user.id, entry_id, **kwargs)
+    except sqlite3.IntegrityError:
+        # скорее всего конфликт UNIQUE(user_id, en_norm) при смене EN
+        if field == "en":
+            await message.answer(
+                "Такое <b>английское слово</b> уже есть в словаре. "
+                "Выбери другое значение.",
+                parse_mode="HTML",
+                reply_markup=kb_menu().as_markup()
+            )
+            return
+        await message.answer("Не удалось обновить из-за ограничения базы данных.", reply_markup=kb_menu().as_markup())
+        return
+
+    if not n:
+        await message.answer("Не удалось обновить (возможно, запись удалена).", reply_markup=kb_menu().as_markup())
+        return
+
+    row = get_entry_by_id(message.from_user.id, entry_id)
+    if not row:
+        await message.answer("Обновила, но запись не нашла.", reply_markup=kb_menu().as_markup())
+        return
+
+    await message.answer(
+        "Обновлено ✅\n\n" + format_item(row, reveal_ru=True),
+        parse_mode="HTML",
+        reply_markup=kb_menu().as_markup()
     )
 
-    preview = f"Сохранено ✅\n\n" + format_item((0, parsed["en"], parsed["ru"], parsed["example"], parsed["tags"]))
-    await message.answer(preview, parse_mode="HTML")
 
-
-# -------------------- callbacks --------------------
+# -------------------- callbacks (pagination + quiz + letters + edit) --------------------
 
 async def cb_nop(call: CallbackQuery):
     await call.answer()
 
 
 async def cb_all(call: CallbackQuery):
-    # ALL|page
     _, page_s = call.data.split("|", 1)
     await edit_all(call, int(page_s))
 
 
 async def cb_letter(call: CallbackQuery):
-    # LET|A|page
     _, letter, page_s = call.data.split("|", 2)
     await edit_letter(call, letter, int(page_s))
 
 
 async def cb_find(call: CallbackQuery):
-    # FIND|token|page
     _, token, page_s = call.data.split("|", 2)
     await edit_find(call, token, int(page_s))
 
 
 async def cb_quiz(call: CallbackQuery):
-    # QUIZ|SHOW|id
-    # QUIZ|NEXT|0
-    # QUIZ|DEL|id
     _, action, id_s = call.data.split("|", 2)
     uid = call.from_user.id
 
@@ -339,7 +469,7 @@ async def cb_quiz(call: CallbackQuery):
     if action == "SHOW":
         row = get_entry_by_id(uid, entry_id)
         if not row:
-            await call.answer("Не найдена эта карточка (возможно, удалена).", show_alert=True)
+            await call.answer("Карточка не найдена (возможно, удалена).", show_alert=True)
             return
         text = "Карточка:\n\n" + format_item(row, reveal_ru=True)
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb_quiz(entry_id, revealed=True).as_markup())
@@ -353,7 +483,6 @@ async def cb_quiz(call: CallbackQuery):
         else:
             await call.answer("Не найдено (уже удалено).", show_alert=True)
 
-        # после удаления — сразу следующая карточка
         row = get_random_entry(uid)
         if not row:
             await call.message.edit_text("Словарь пуст.", parse_mode="HTML")
@@ -361,6 +490,92 @@ async def cb_quiz(call: CallbackQuery):
         text = "Карточка:\n\n" + format_item(row, reveal_ru=False)
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb_quiz(row[0], revealed=False).as_markup())
         return
+
+
+async def cb_edit(call: CallbackQuery, state: FSMContext):
+    # EDIT|PICK|<id>
+    # EDIT|FIELD|<field>|<id>
+    parts = call.data.split("|")
+    action = parts[1]
+
+    # при навигации редактирования — не чистим state без нужды
+    if action == "PICK":
+        entry_id = int(parts[2])
+        row = get_entry_by_id(call.from_user.id, entry_id)
+        if not row:
+            await call.answer("Запись не найдена.", show_alert=True)
+            return
+
+        await call.message.answer(
+            "Что редактируем?\n\n" + format_item(row, reveal_ru=True),
+            parse_mode="HTML",
+            reply_markup=kb_edit_fields(entry_id).as_markup()
+        )
+        await call.answer()
+        return
+
+    if action == "FIELD":
+        field = parts[2]
+        entry_id = int(parts[3])
+
+        await state.set_state(UiState.waiting_edit_value)
+        await state.update_data(edit_entry_id=entry_id, edit_field=field)
+
+        prompt = {
+            "en": "Введите новое <b>английское</b> слово/фразу:",
+            "ru": "Введите новый <b>русский перевод</b>:",
+            "example": "Введите новый <b>пример</b> (или '-' чтобы очистить):",
+            "tags": "Введите новые <b>теги</b> (или '-' чтобы очистить):",
+        }.get(field, "Введите новое значение:")
+
+        await call.message.answer(prompt, parse_mode="HTML", reply_markup=kb_cancel().as_markup())
+        await call.answer()
+        return
+
+    await call.answer()
+
+
+# -------------------- adding by plain text --------------------
+
+async def on_text_add(message: Message):
+    """
+    Добавление слова/фразы обычным сообщением: EN — RU | ex: ... | tag: ...
+    """
+    parsed = parse_entry(message.text)
+    if not parsed:
+        await message.answer(
+            "Не понял формат.\n"
+            "Добавляй так:\n<b>word — перевод | ex: пример | tag: тег</b>\n\n"
+            "Или пользуйся кнопками 👇",
+            parse_mode="HTML",
+            reply_markup=kb_menu().as_markup()
+        )
+        return
+
+    upsert_entry(
+        user_id=message.from_user.id,
+        en=parsed["en"],
+        ru=parsed["ru"],
+        example=parsed["example"],
+        tags=parsed["tags"]
+    )
+
+    preview = "Сохранено ✅\n\n" + format_item((0, parsed["en"], parsed["ru"], parsed["example"], parsed["tags"]))
+    await message.answer(preview, parse_mode="HTML", reply_markup=kb_menu().as_markup())
+
+
+# -------------------- commands --------------------
+
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Привет! Я твой личный словарь.\n\n"
+        "Добавляй слова сообщением:\n"
+        "<b>word — перевод | ex: пример | tag: тег</b>\n\n"
+        "Или пользуйся кнопками 👇",
+        parse_mode="HTML",
+        reply_markup=kb_menu().as_markup()
+    )
 
 
 # -------------------- main --------------------
@@ -374,20 +589,29 @@ def main():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
 
+    # /start
     dp.message.register(cmd_start, Command("start"))
-    dp.message.register(cmd_list, Command("list"))
-    dp.message.register(cmd_letter, Command("letter"))
-    dp.message.register(cmd_find, Command("find"))
-    dp.message.register(cmd_delete, Command("delete"))
-    dp.message.register(cmd_quiz, Command("quiz"))
 
+    # меню
+    dp.callback_query.register(cb_menu, F.data.startswith("MENU|"))
+    dp.callback_query.register(cb_cancel, F.data == "CANCEL")
+
+    # пагинация/квиз/редактирование callbacks
     dp.callback_query.register(cb_nop, F.data == "NOP")
     dp.callback_query.register(cb_all, F.data.startswith("ALL|"))
     dp.callback_query.register(cb_letter, F.data.startswith("LET|"))
     dp.callback_query.register(cb_find, F.data.startswith("FIND|"))
     dp.callback_query.register(cb_quiz, F.data.startswith("QUIZ|"))
+    dp.callback_query.register(cb_edit, F.data.startswith("EDIT|"))
 
-    dp.message.register(on_text, F.text)
+    # FSM: ввод по сценариям (ВАЖНО: до on_text_add)
+    dp.message.register(on_find_query, UiState.waiting_find, F.text)
+    dp.message.register(on_delete_query, UiState.waiting_delete, F.text)
+    dp.message.register(on_edit_query, UiState.waiting_edit_query, F.text)
+    dp.message.register(on_edit_value, UiState.waiting_edit_value, F.text)
+
+    # добавление по умолчанию
+    dp.message.register(on_text_add, F.text)
 
     dp.run_polling(bot)
 
