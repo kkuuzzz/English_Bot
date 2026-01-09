@@ -257,7 +257,7 @@ async def cmd_delete(message: Message):
     if n:
         await message.answer(f"Удалено ✅: <b>{esc(en)}</b>", parse_mode="HTML")
     else:
-        await message.answer(f"Не нашла слово: <b>{esc(en)}</b>", parse_mode="HTML")
+        await message.answer(f"Не найдено слово: <b>{esc(en)}</b>", parse_mode="HTML")
 
 
 async def cmd_quiz(message: Message):
@@ -289,7 +289,7 @@ async def on_text(message: Message):
         tags=parsed["tags"]
     )
 
-    preview = f"Сохранила ✅\n\n" + format_item((0, parsed["en"], parsed["ru"], parsed["example"], parsed["tags"]))
+    preview = f"Сохранено ✅\n\n" + format_item((0, parsed["en"], parsed["ru"], parsed["example"], parsed["tags"]))
     await message.answer(preview, parse_mode="HTML")
 
 
@@ -339,7 +339,7 @@ async def cb_quiz(call: CallbackQuery):
     if action == "SHOW":
         row = get_entry_by_id(uid, entry_id)
         if not row:
-            await call.answer("Не нашла эту карточку (возможно, удалена).", show_alert=True)
+            await call.answer("Не найдена эта карточка (возможно, удалена).", show_alert=True)
             return
         text = "Карточка:\n\n" + format_item(row, reveal_ru=True)
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb_quiz(entry_id, revealed=True).as_markup())
@@ -351,7 +351,7 @@ async def cb_quiz(call: CallbackQuery):
         if n:
             await call.answer("Удалено ✅")
         else:
-            await call.answer("Не нашла (уже удалено).", show_alert=True)
+            await call.answer("Не найдено (уже удалено).", show_alert=True)
 
         # после удаления — сразу следующая карточка
         row = get_random_entry(uid)
