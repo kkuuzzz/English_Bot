@@ -1,7 +1,9 @@
 import html
 import uuid
-from math import ceil
+import re
 import sqlite3
+
+from math import ceil
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
@@ -19,7 +21,6 @@ from database import (
     count_all, count_by_letter, count_find,
     delete_by_en, delete_by_id,
     get_random_entry, get_entry_by_id,
-    # NEW:
     update_entry, search_entries_both
 )
 
@@ -34,10 +35,11 @@ FIND_CACHE: dict[int, dict[str, str]] = {}
 # -------------------- FSM --------------------
 
 class UiState(StatesGroup):
-    waiting_find = State()
+    waiting_bulk_add = State()
     waiting_delete = State()
     waiting_edit_query = State()
     waiting_edit_value = State()
+    waiting_find = State()
 
 
 # -------------------- formatting --------------------
@@ -81,11 +83,12 @@ def kb_menu() -> InlineKeyboardBuilder:
     b = InlineKeyboardBuilder()
     b.button(text="📚 Список", callback_data="MENU|LIST")
     b.button(text="🔤 Буквы", callback_data="MENU|LETTERS")
+    b.button(text="➕ Массово", callback_data="MENU|BULK")
     b.button(text="🔎 Найти", callback_data="MENU|FIND")
     b.button(text="✏️ Правка", callback_data="MENU|EDIT")
     b.button(text="🗑 Удалить", callback_data="MENU|DELETE")
     b.button(text="🧠 Квиз", callback_data="MENU|QUIZ")
-    b.adjust(2, 2, 2)
+    b.adjust(2, 2, 2, 1)
     return b
 
 
@@ -324,6 +327,22 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
         await call.message.answer(text, parse_mode="HTML", reply_markup=kb_quiz(row[0], revealed=False).as_markup())
         return
 
+    if action == "BULK":
+        await call.answer()
+        await state.set_state(UiState.waiting_bulk_add)
+        await call.message.answer(
+            "Вставь список слов (по одной строке):\n"
+            "<b>word — перевод</b>\n\n"
+            "Можно также:\n"
+            "• <b>word — перевод | ex: пример | tag: тег</b>\n"
+            "• или просто <b>word — перевод</b>\n\n"
+            "Чтобы очистить поле example/tags — используй '-' в режиме редактирования.\n\n"
+            "Отправь одним сообщением 👇",
+            parse_mode="HTML",
+            reply_markup=kb_cancel().as_markup()
+        )
+        return
+
     await call.answer()
 
 
@@ -536,6 +555,91 @@ async def cb_edit(call: CallbackQuery, state: FSMContext):
 
 # -------------------- adding by plain text --------------------
 
+def parse_bulk_lines(text: str):
+    items = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        # убираем маркеры/нумерацию
+        line = line.lstrip("•*-").strip()
+        line = re.sub(r"^\d+\s*[).\-]\s*", "", line)
+
+        parsed = parse_entry(line)
+        if parsed:
+            items.append(parsed)
+            continue
+
+        # fallback: "en — ru" или "en - ru"
+        if "—" in line:
+            en, ru = line.split("—", 1)
+            en, ru = en.strip(), ru.strip()
+            if en and ru:
+                items.append({"en": en, "ru": ru, "example": None, "tags": None})
+                continue
+
+        if " - " in line:
+            en, ru = line.split(" - ", 1)
+            en, ru = en.strip(), ru.strip()
+            if en and ru:
+                items.append({"en": en, "ru": ru, "example": None, "tags": None})
+                continue
+
+        items.append({"_error": raw})
+
+    return items
+
+
+async def on_bulk_add(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    await state.clear()
+
+    if not text:
+        await message.answer(
+            "Пусто. Вставь список и отправь одним сообщением.",
+            reply_markup=kb_menu().as_markup()
+        )
+        return
+
+    items = parse_bulk_lines(text)
+    uid = message.from_user.id
+
+    saved = 0
+    skipped = 0
+    errors = []
+
+    for it in items:
+        if "_error" in it:
+            skipped += 1
+            errors.append(it["_error"])
+            continue
+
+        try:
+            upsert_entry(
+                user_id=uid,
+                en=it["en"],
+                ru=it["ru"],
+                example=it.get("example"),
+                tags=it.get("tags")
+            )
+            saved += 1
+        except Exception as e:
+            skipped += 1
+            errors.append(f"{it.get('en', '?')} — {it.get('ru', '?')} ({e})")
+
+    await message.answer(
+        f"Готово ✅\nСохранено/обновлено: <b>{saved}</b>\nПропущено: <b>{skipped}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_menu().as_markup()
+    )
+
+    if errors:
+        preview = "\n".join(f"• {esc(str(x))}" for x in errors[:10])
+        tail = "\n<i>…и ещё есть</i>" if len(errors) > 10 else ""
+        await message.answer("Не распознала строки:\n" + preview + tail, parse_mode="HTML")
+
+
 async def on_text_add(message: Message):
     """
     Добавление слова/фразы обычным сообщением: EN — RU | ex: ... | tag: ...
@@ -603,11 +707,12 @@ def main():
     dp.callback_query.register(cb_quiz, F.data.startswith("QUIZ|"))
     dp.callback_query.register(cb_edit, F.data.startswith("EDIT|"))
 
-    # FSM: ввод по сценариям (ВАЖНО: до on_text_add)
+    # FSM: ввод по сценариям
     dp.message.register(on_find_query, UiState.waiting_find, F.text)
     dp.message.register(on_delete_query, UiState.waiting_delete, F.text)
     dp.message.register(on_edit_query, UiState.waiting_edit_query, F.text)
     dp.message.register(on_edit_value, UiState.waiting_edit_value, F.text)
+    dp.message.register(on_bulk_add, UiState.waiting_bulk_add, F.text)
 
     # добавление по умолчанию
     dp.message.register(on_text_add, F.text)
