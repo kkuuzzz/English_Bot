@@ -85,11 +85,8 @@ def kb_menu() -> InlineKeyboardBuilder:
     b.button(text="✏️ Правка", callback_data="MENU|EDIT")
     b.button(text="🗑 Удалить", callback_data="MENU|DELETE")
     b.button(text="🧠 Квиз", callback_data="MENU|QUIZ")
-
-    # 2 кнопки в ряд (важно!)
     b.adjust(2, 2, 2)
     return b
-
 
 
 def kb_menu_row() -> InlineKeyboardBuilder:
@@ -184,14 +181,13 @@ def kb_edit_pick(rows) -> InlineKeyboardBuilder:
 
 def kb_edit_fields(entry_id: int) -> InlineKeyboardBuilder:
     b = InlineKeyboardBuilder()
-    b.button(text="EN (английское)", callback_data=f"EDIT|FIELD|en|{entry_id}")
-    b.button(text="RU (перевод)", callback_data=f"EDIT|FIELD|ru|{entry_id}")
-    b.row()
-    b.button(text="Example (пример)", callback_data=f"EDIT|FIELD|example|{entry_id}")
-    b.button(text="Tags (теги)", callback_data=f"EDIT|FIELD|tags|{entry_id}")
-    b.row()
+    b.button(text="EN ✏️", callback_data=f"EDIT|FIELD|en|{entry_id}")
+    b.button(text="RU ✏️", callback_data=f"EDIT|FIELD|ru|{entry_id}")
+    b.button(text="EXAMPLE ✏️", callback_data=f"EDIT|FIELD|example|{entry_id}")
+    b.button(text="TAG ✏️", callback_data=f"EDIT|FIELD|tags|{entry_id}")
     b.button(text="❌ Отмена", callback_data="CANCEL")
     b.button(text="🏠 Меню", callback_data="MENU|HOME")
+    b.adjust(2, 2, 2)
     return b
 
 
@@ -204,7 +200,6 @@ async def send_all(message: Message, user_id: int, page: int = 0):
     rows = list_entries(user_id, limit=PAGE_SIZE, offset=page * PAGE_SIZE)
     text = format_list(rows, title=f"Словарь (всего: {total})")
     await message.answer(text, parse_mode="HTML", reply_markup=kb_all(page, tp).as_markup())
-
 
 
 async def edit_all(call: CallbackQuery, page: int):
@@ -388,7 +383,8 @@ async def on_edit_value(message: Message, state: FSMContext):
     await state.clear()
 
     if not entry_id or not field:
-        await message.answer("Не смогла понять, что редактируем. Открой меню и попробуй снова.", reply_markup=kb_menu().as_markup())
+        await message.answer("Не смогла понять, что редактируем. Открой меню и попробуй снова.",
+                             reply_markup=kb_menu().as_markup())
         return
 
     if value == "-":
