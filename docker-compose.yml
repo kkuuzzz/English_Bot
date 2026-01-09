@@ -1,0 +1,15 @@
+services:
+  tg-dict-bot:
+    build: .
+    container_name: tg-dict-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DB_PATH=/data/dict.db
+      - TZ=Europe/Moscow
+    volumes:
+      - bot_data:/data
+
+volumes:
+  bot_data:
