@@ -2,21 +2,44 @@ import os
 import sqlite3
 from datetime import datetime
 
+# Путь к файлу базы данных.
+# Можно переопределить через переменную окружения DB_PATH
 DB_PATH = os.getenv("DB_PATH", "dict.db")
 
 
 def get_conn():
+    """
+    Создаёт и возвращает новое соединение с SQLite-базой данных.
+
+    Используется во всех запросах.
+    Соединение открывается и закрывается автоматически через контекстный менеджер.
+    """
     return sqlite3.connect(DB_PATH)
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """
+    Проверяет, существует ли указанный столбец в таблице SQLite.
+
+    Используется для миграций схемы БД (например, при добавлении новых колонок).
+    Возвращает True, если колонка существует, иначе False.
+    """
     cur = conn.execute(f"PRAGMA table_info({table});")
-    cols = [row[1] for row in cur.fetchall()]  # row[1] = name
+    cols = [row[1] for row in cur.fetchall()]  # row[1] — имя колонки
     return column in cols
 
 
 def init_db():
+    """
+    Инициализирует базу данных словаря.
+
+    Выполняет:
+    - создание таблицы entries (если она ещё не существует)
+    - миграцию старых БД (добавление ru_norm)
+    - создание индексов для ускорения поиска и фильтрации
+    """
     with get_conn() as conn:
+        # Основная таблица словаря
         conn.execute("""
         CREATE TABLE IF NOT EXISTS entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,17 +56,25 @@ def init_db():
         """)
 
         # ---- migration: add ru_norm if missing ----
+        # Поиск по русскому переводу
         if not _column_exists(conn, "entries", "ru_norm"):
             conn.execute("ALTER TABLE entries ADD COLUMN ru_norm TEXT;")
             conn.execute("UPDATE entries SET ru_norm=lower(ru) WHERE ru_norm IS NULL;")
 
-        # indexes
+        # Индексы для быстрого поиска и сортировки
         conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_user_en ON entries(user_id, en_norm);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_user_ru ON entries(user_id, ru_norm);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_user_en_first ON entries(user_id, substr(en_norm,1,1));")
 
 
 def upsert_entry(user_id: int, en: str, ru: str, example: str | None, tags: str | None):
+    """
+    Добавляет новое слово в словарь или обновляет существующее.
+
+    Уникальность определяется по паре (user_id, en_norm).
+    Если слово с таким английским написанием уже существует —
+    запись будет обновлена (перевод, пример, теги).
+    """
     en_norm = en.strip().lower()
     ru_norm = ru.strip().lower()
     now = datetime.utcnow().isoformat(timespec="seconds")
@@ -62,25 +93,57 @@ def upsert_entry(user_id: int, en: str, ru: str, example: str | None, tags: str 
 
 
 def delete_by_en(user_id: int, en: str) -> int:
+    """
+    Удаляет запись по английскому слову.
+
+    Удаление производится с учётом user_id.
+    Возвращает количество удалённых строк (0 или 1).
+    """
     en_norm = en.strip().lower()
     with get_conn() as conn:
-        cur = conn.execute("DELETE FROM entries WHERE user_id=? AND en_norm=?", (user_id, en_norm))
+        cur = conn.execute(
+            "DELETE FROM entries WHERE user_id=? AND en_norm=?",
+            (user_id, en_norm)
+        )
         return cur.rowcount
 
 
 def delete_by_id(user_id: int, entry_id: int) -> int:
+    """
+    Удаляет запись по её ID.
+
+    Используется, например, в квизе или при точечном удалении.
+    Возвращает количество удалённых строк (0 или 1).
+    """
     with get_conn() as conn:
-        cur = conn.execute("DELETE FROM entries WHERE user_id=? AND id=?", (user_id, entry_id))
+        cur = conn.execute(
+            "DELETE FROM entries WHERE user_id=? AND id=?",
+            (user_id, entry_id)
+        )
         return cur.rowcount
 
 
 def count_all(user_id: int) -> int:
+    """
+    Возвращает общее количество слов в словаре пользователя.
+
+    Используется для отображения статистики и пагинации.
+    """
     with get_conn() as conn:
-        cur = conn.execute("SELECT COUNT(*) FROM entries WHERE user_id=?", (user_id,))
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE user_id=?",
+            (user_id,)
+        )
         return int(cur.fetchone()[0])
 
 
 def count_by_letter(user_id: int, letter: str) -> int:
+    """
+    Возвращает количество слов пользователя,
+    начинающихся на указанную букву (A–Z).
+
+    Сравнение идёт по нормализованному английскому слову (en_norm).
+    """
     letter_norm = letter.strip().lower()[:1]
     with get_conn() as conn:
         cur = conn.execute("""
@@ -91,6 +154,13 @@ def count_by_letter(user_id: int, letter: str) -> int:
 
 
 def count_find(user_id: int, q: str) -> int:
+    """
+    Возвращает количество слов, подходящих под поисковый запрос.
+
+    Поиск выполняется по:
+    - en_norm (английское слово)
+    - ru_norm (русский перевод)
+    """
     qn = f"%{q.strip().lower()}%"
     with get_conn() as conn:
         cur = conn.execute("""
@@ -101,6 +171,11 @@ def count_find(user_id: int, q: str) -> int:
 
 
 def list_entries(user_id: int, limit: int = 20, offset: int = 0):
+    """
+    Возвращает список слов пользователя с пагинацией.
+
+    Сортировка — по алфавиту (en_norm).
+    """
     with get_conn() as conn:
         cur = conn.execute("""
         SELECT id, en, ru, example, tags
@@ -113,6 +188,12 @@ def list_entries(user_id: int, limit: int = 20, offset: int = 0):
 
 
 def list_by_letter(user_id: int, letter: str, limit: int = 20, offset: int = 0):
+    """
+    Возвращает список слов пользователя,
+    начинающихся на заданную букву.
+
+    Поддерживает пагинацию.
+    """
     letter_norm = letter.strip().lower()[:1]
     with get_conn() as conn:
         cur = conn.execute("""
@@ -126,6 +207,11 @@ def list_by_letter(user_id: int, letter: str, limit: int = 20, offset: int = 0):
 
 
 def find_entries(user_id: int, q: str, limit: int = 20, offset: int = 0):
+    """
+    Возвращает список слов, соответствующих поисковому запросу.
+
+    Поиск выполняется по английскому слову и русскому переводу.
+    """
     qn = f"%{q.strip().lower()}%"
     with get_conn() as conn:
         cur = conn.execute("""
@@ -139,6 +225,12 @@ def find_entries(user_id: int, q: str, limit: int = 20, offset: int = 0):
 
 
 def get_random_entry(user_id: int):
+    """
+    Возвращает случайное слово из словаря пользователя.
+
+    Используется в режиме квиза.
+    Если слов нет — возвращает None.
+    """
     with get_conn() as conn:
         cur = conn.execute("""
         SELECT id, en, ru, example, tags
@@ -151,6 +243,11 @@ def get_random_entry(user_id: int):
 
 
 def get_entry_by_id(user_id: int, entry_id: int):
+    """
+    Возвращает одну запись по её ID.
+
+    Используется при редактировании и отображении карточек.
+    """
     with get_conn() as conn:
         cur = conn.execute("""
         SELECT id, en, ru, example, tags
@@ -160,10 +257,21 @@ def get_entry_by_id(user_id: int, entry_id: int):
         return cur.fetchone()
 
 
-def update_entry(user_id: int, entry_id: int, en: str | None = None, ru: str | None = None,
-                 example: str | None = None, tags: str | None = None) -> int:
+def update_entry(
+    user_id: int,
+    entry_id: int,
+    en: str | None = None,
+    ru: str | None = None,
+    example: str | None = None,
+    tags: str | None = None
+) -> int:
     """
-    Частичное обновление записи. None = поле не трогаем.
+    Частично обновляет запись словаря.
+
+    Обновляются только те поля, которые переданы (не None).
+    Поля, равные None, остаются без изменений.
+
+    Возвращает количество обновлённых строк (0 или 1).
     """
     sets = []
     params = []
@@ -199,7 +307,9 @@ def update_entry(user_id: int, entry_id: int, en: str | None = None, ru: str | N
 
 def search_entries_both(user_id: int, q: str, limit: int = 10):
     """
-    Быстрый поиск для выбора записи при редактировании: по en_norm и ru_norm.
+    Выполняет быстрый поиск слов по английскому и русскому значению.
+
+    Используется при редактировании для выбора записи.
     """
     qn = f"%{q.strip().lower()}%"
     with get_conn() as conn:
@@ -211,3 +321,18 @@ def search_entries_both(user_id: int, q: str, limit: int = 10):
         LIMIT ?
         """, (user_id, qn, qn, limit))
         return cur.fetchall()
+
+
+def delete_all_entries(user_id: int) -> int:
+    """
+    Удаляет ВСЕ записи пользователя из словаря.
+
+    Используется при полной очистке словаря.
+    Возвращает количество удалённых строк.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM entries WHERE user_id=?",
+            (user_id,)
+        )
+        return cur.rowcount

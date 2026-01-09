@@ -21,7 +21,8 @@ from database import (
     count_all, count_by_letter, count_find,
     delete_by_en, delete_by_id,
     get_random_entry, get_entry_by_id,
-    update_entry, search_entries_both
+    update_entry, search_entries_both,
+    delete_all_entries
 )
 
 from parser import parse_entry
@@ -88,7 +89,8 @@ def kb_menu() -> InlineKeyboardBuilder:
     b.button(text="✏️ Правка", callback_data="MENU|EDIT")
     b.button(text="🗑 Удалить", callback_data="MENU|DELETE")
     b.button(text="🧠 Квиз", callback_data="MENU|QUIZ")
-    b.adjust(2, 2, 2, 1)
+    b.button(text="🔥 Очистить всё", callback_data="MENU|CLEAR_ALL")
+    b.adjust(2, 2, 2, 2)
     return b
 
 
@@ -179,6 +181,13 @@ def kb_edit_pick(rows) -> InlineKeyboardBuilder:
         b.row()
     b.row()
     b.attach(kb_menu_row())
+    return b
+
+def kb_confirm_clear_all() -> InlineKeyboardBuilder:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Да, удалить всё", callback_data="CLEAR_ALL|YES")
+    b.button(text="❌ Отмена", callback_data="CLEAR_ALL|NO")
+    b.adjust(1, 1)
     return b
 
 
@@ -340,6 +349,17 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
             "Отправь одним сообщением 👇",
             parse_mode="HTML",
             reply_markup=kb_cancel().as_markup()
+        )
+        return
+
+    if action == "CLEAR_ALL":
+        await call.answer()
+        await call.message.answer(
+            "⚠️ <b>Ты уверена?</b>\n\n"
+            "Будут удалены <u>ВСЕ слова</u> из словаря.\n"
+            "Это действие нельзя отменить.",
+            parse_mode="HTML",
+            reply_markup=kb_confirm_clear_all().as_markup()
         )
         return
 
@@ -552,6 +572,29 @@ async def cb_edit(call: CallbackQuery, state: FSMContext):
 
     await call.answer()
 
+async def cb_clear_all(call: CallbackQuery):
+    _, decision = call.data.split("|", 1)
+
+    if decision == "NO":
+        await call.answer("Отменено")
+        await call.message.answer(
+            "Ок, удаление отменено",
+            reply_markup=kb_menu().as_markup()
+        )
+        return
+
+    # YES
+    n = delete_all_entries(call.from_user.id)
+    await call.answer("Готово")
+
+    await call.message.answer(
+        f"🗑 Удалено слов: <b>{n}</b>\n\n"
+        "Словарь теперь пуст.",
+        parse_mode="HTML",
+        reply_markup=kb_menu().as_markup()
+    )
+
+
 
 # -------------------- adding by plain text --------------------
 
@@ -706,6 +749,7 @@ def main():
     dp.callback_query.register(cb_find, F.data.startswith("FIND|"))
     dp.callback_query.register(cb_quiz, F.data.startswith("QUIZ|"))
     dp.callback_query.register(cb_edit, F.data.startswith("EDIT|"))
+    dp.callback_query.register(cb_clear_all, F.data.startswith("CLEAR_ALL|"))
 
     # FSM: ввод по сценариям
     dp.message.register(on_find_query, UiState.waiting_find, F.text)
