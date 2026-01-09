@@ -263,7 +263,7 @@ async def cmd_delete(message: Message):
 async def cmd_quiz(message: Message):
     row = get_random_entry(message.from_user.id)
     if not row:
-        await message.answer("Словарь пуст — сначала добавь пару слов 🙂", parse_mode="HTML")
+        await message.answer("Словарь пуст — сначала добавь пару слов", parse_mode="HTML")
         return
     text = "Карточка:\n\n" + format_item(row, reveal_ru=False)
     await message.answer(text, parse_mode="HTML", reply_markup=kb_quiz(row[0], revealed=False).as_markup())
@@ -275,7 +275,7 @@ async def on_text(message: Message):
     parsed = parse_entry(message.text)
     if not parsed:
         await message.answer(
-            "Не понял формат 😅\n"
+            "Не понял формат\n"
             "Попробуй так:\n<b>word — перевод | ex: пример | tag: тег</b>",
             parse_mode="HTML"
         )
