@@ -79,15 +79,17 @@ def pages(total: int) -> int:
 
 def kb_menu() -> InlineKeyboardBuilder:
     b = InlineKeyboardBuilder()
-    b.button(text="📚 Список слов", callback_data="MENU|LIST")
-    b.button(text="🔤 По буквам (A–Z)", callback_data="MENU|LETTERS")
-    b.row()
-    b.button(text="🔎 Найти слово", callback_data="MENU|FIND")
-    b.button(text="✏️ Редактировать", callback_data="MENU|EDIT")
-    b.row()
-    b.button(text="🗑 Удалить слово", callback_data="MENU|DELETE")
+    b.button(text="📚 Список", callback_data="MENU|LIST")
+    b.button(text="🔤 Буквы", callback_data="MENU|LETTERS")
+    b.button(text="🔎 Найти", callback_data="MENU|FIND")
+    b.button(text="✏️ Правка", callback_data="MENU|EDIT")
+    b.button(text="🗑 Удалить", callback_data="MENU|DELETE")
     b.button(text="🧠 Квиз", callback_data="MENU|QUIZ")
+
+    # 2 кнопки в ряд (важно!)
+    b.adjust(2, 2, 2)
     return b
+
 
 
 def kb_menu_row() -> InlineKeyboardBuilder:
@@ -195,13 +197,14 @@ def kb_edit_fields(entry_id: int) -> InlineKeyboardBuilder:
 
 # -------------------- render pages --------------------
 
-async def send_all(message: Message, page: int = 0):
-    total = count_all(message.from_user.id)
+async def send_all(message: Message, user_id: int, page: int = 0):
+    total = count_all(user_id)
     tp = pages(total)
     page = min(max(page, 0), tp - 1)
-    rows = list_entries(message.from_user.id, limit=PAGE_SIZE, offset=page * PAGE_SIZE)
+    rows = list_entries(user_id, limit=PAGE_SIZE, offset=page * PAGE_SIZE)
     text = format_list(rows, title=f"Словарь (всего: {total})")
     await message.answer(text, parse_mode="HTML", reply_markup=kb_all(page, tp).as_markup())
+
 
 
 async def edit_all(call: CallbackQuery, page: int):
@@ -278,7 +281,7 @@ async def cb_menu(call: CallbackQuery, state: FSMContext):
 
     if action == "LIST":
         await call.answer()
-        await send_all(call.message, page=0)
+        await send_all(call.message, user_id=call.from_user.id, page=0)
         return
 
     if action == "LETTERS":
